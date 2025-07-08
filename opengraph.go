@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
 )
 
 // OpenGraphFetcher handles concurrent OpenGraph metadata fetching
@@ -64,18 +66,38 @@ func (ogf *OpenGraphFetcher) FetchOpenGraphData(url string) (*OpenGraphData, err
 	// Check content type
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
+		slog.Debug("Skipping non-HTML content", "url", url, "content_type", contentType)
 		return nil, fmt.Errorf("unsupported content type: %s", contentType)
+	}
+
+	// Handle compression (gzip/deflate)
+	var reader io.ReadCloser
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err = gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer reader.Close()
+	default:
+		reader = resp.Body
 	}
 
 	// Read response body with size limit
 	const maxBodySize = 1024 * 1024 // 1MB limit
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	body, err := io.ReadAll(io.LimitReader(reader, maxBodySize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	// Convert body to UTF-8 string with proper encoding detection
+	htmlContent, err := ogf.convertToUTF8(body, resp.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert content to UTF-8: %w", err)
+	}
+
 	// Parse OpenGraph tags
-	og, err := ogf.parseOpenGraphTags(string(body))
+	og, err := ogf.parseOpenGraphTags(htmlContent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse OpenGraph tags: %w", err)
 	}
@@ -125,6 +147,9 @@ func (ogf *OpenGraphFetcher) parseOpenGraphTags(htmlContent string) (*OpenGraphD
 
 	// Apply fallbacks if primary OpenGraph tags are missing
 	ogf.applyFallbacks(og, htmlContent)
+
+	// Log successful extraction
+	slog.Debug("OpenGraph extraction successful", "url", og.URL, "title", og.Title, "has_desc", og.Description != "", "has_image", og.Image != "")
 
 	return og, nil
 }
@@ -253,10 +278,15 @@ func (ogf *OpenGraphFetcher) cleanupOpenGraphData(og *OpenGraphData) *OpenGraphD
 		og.Image = ""
 	}
 
-	// Clean up whitespace
+	// Clean up whitespace and normalize
 	og.Title = strings.TrimSpace(og.Title)
 	og.Description = strings.TrimSpace(og.Description)
 	og.SiteName = strings.TrimSpace(og.SiteName)
+
+	// Remove any null bytes or control characters that might cause issues
+	og.Title = strings.ReplaceAll(og.Title, "\x00", "")
+	og.Description = strings.ReplaceAll(og.Description, "\x00", "")
+	og.SiteName = strings.ReplaceAll(og.SiteName, "\x00", "")
 
 	return og
 }
@@ -265,11 +295,13 @@ func (ogf *OpenGraphFetcher) cleanupOpenGraphData(og *OpenGraphData) *OpenGraphD
 func (ogf *OpenGraphFetcher) GetOpenGraphPreview(url string) *OpenGraphData {
 	// Check if it's a Reddit URL - skip OpenGraph for Reddit links
 	if isRedditURL(url) {
+		slog.Debug("Skipping Reddit URL", "url", url)
 		return nil
 	}
 
 	// Check if it's a blocked URL - skip OpenGraph for blocked domains
 	if isBlockedURL(url) {
+		slog.Debug("Skipping blocked URL", "url", url)
 		return nil
 	}
 
@@ -291,6 +323,8 @@ func (ogf *OpenGraphFetcher) GetOpenGraphPreview(url string) *OpenGraphData {
 		slog.Warn("Failed to fetch OpenGraph data", "url", url, "error", err)
 		return nil
 	}
+
+	slog.Debug("OpenGraph data fetched successfully", "url", url, "title", og.Title, "description_length", len(og.Description))
 
 	// Save to database cache
 	if ogf.db != nil {
@@ -321,6 +355,7 @@ func (ogf *OpenGraphFetcher) FetchConcurrentOpenGraph(urls []string) map[string]
 	const maxConcurrent = 5
 	semaphore := make(chan struct{}, maxConcurrent)
 
+	slog.Info("Starting concurrent OpenGraph fetch", "total_urls", len(urls))
 	for _, url := range urls {
 		if url == "" {
 			continue
@@ -333,7 +368,13 @@ func (ogf *OpenGraphFetcher) FetchConcurrentOpenGraph(urls []string) map[string]
 			semaphore <- struct{}{}        // Acquire
 			defer func() { <-semaphore }() // Release
 
+			slog.Debug("Processing URL for OpenGraph", "url", u)
 			og := ogf.GetOpenGraphPreview(u)
+			if og != nil {
+				slog.Debug("OpenGraph preview obtained", "url", u, "title", og.Title)
+			} else {
+				slog.Debug("No OpenGraph preview obtained", "url", u)
+			}
 			results <- result{url: u, og: og}
 		}(url)
 	}
@@ -374,6 +415,9 @@ func isBlockedURL(url string) bool {
 		"facebook.com",
 		"instagram.com",
 		"linkedin.com",
+		"i.redd.it",          // Reddit image URLs don't have useful OpenGraph
+		"v.redd.it",          // Reddit video URLs don't have useful OpenGraph
+		"reddit.com/gallery", // Reddit gallery URLs don't have useful OpenGraph
 	}
 
 	for _, domain := range blockedDomains {
@@ -382,4 +426,26 @@ func isBlockedURL(url string) bool {
 		}
 	}
 	return false
+}
+
+// convertToUTF8 converts response body to UTF-8 string with proper encoding detection
+func (ogf *OpenGraphFetcher) convertToUTF8(body []byte, contentType string) (string, error) {
+	// Try to detect encoding from content type or HTML meta tags
+	reader := strings.NewReader(string(body))
+
+	// Use charset package to detect and convert encoding
+	utf8Reader, err := charset.NewReader(reader, contentType)
+	if err != nil {
+		// If charset detection fails, assume UTF-8
+		slog.Warn("Failed to detect charset, assuming UTF-8", "error", err)
+		return string(body), nil
+	}
+
+	// Read the UTF-8 converted content
+	utf8Bytes, err := io.ReadAll(utf8Reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert to UTF-8: %w", err)
+	}
+
+	return string(utf8Bytes), nil
 }

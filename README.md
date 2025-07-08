@@ -87,14 +87,14 @@ The application creates a `reddit_feed_config.json` file with your settings:
   "score_filter": 50,
   "comment_filter": 10,
   "feed_type": "rss",
-  "output_path": "reddit_homepage_feed.xml"
+  "output_path": "reddit.xml"
 }
 ```
 
 ## Files Created
 
 - `reddit_feed_config.json`: Application configuration
-- `reddit_homepage_feed.xml`: Generated RSS/Atom feed
+- `reddit.xml`: Generated RSS/Atom feed
 - `opengraph_cache.db`: SQLite database for OpenGraph caching
 
 ## Technical Details

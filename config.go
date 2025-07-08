@@ -128,5 +128,5 @@ func InitializeDefaultConfig() {
 	GlobalConfig.ScoreFilter = 0
 	GlobalConfig.CommentFilter = 0
 	GlobalConfig.FeedType = "rss"
-	GlobalConfig.OutputPath = "reddit_homepage_feed.xml"
+	GlobalConfig.OutputPath = "reddit.xml"
 }

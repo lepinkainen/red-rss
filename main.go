@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/gorilla/feeds"
@@ -24,9 +25,13 @@ func main() {
 
 	// Parse command-line flags
 	var (
-		configURL = flag.String("config", "", "URL to load remote configuration from")
-		version   = flag.Bool("version", false, "Show version information")
-		verbose   = flag.Bool("verbose", false, "Enable verbose logging")
+		configURL  = flag.String("config", "", "URL to load remote configuration from")
+		configPath = flag.String("config-file", "", "path to local configuration file (optional)")
+		version    = flag.Bool("version", false, "Show version information")
+		debug      = flag.Bool("debug", false, "enable debug logging")
+		outDir     = flag.String("outdir", ".", "directory where the RSS feed file will be saved")
+		minPoints  = flag.Int("min-points", 50, "minimum points threshold for items to include in RSS feed")
+		limit      = flag.Int("limit", 30, "maximum number of items to include in RSS feed")
 	)
 	flag.Parse()
 
@@ -35,17 +40,23 @@ func main() {
 		return
 	}
 
-	if *verbose {
+	if *debug {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 
-	slog.Info("Starting GoRedditFeedGenerator", "version", Version)
+	slog.Debug("Starting GoRedditFeedGenerator", "version", Version)
 
 	// Initialize default configuration
 	InitializeDefaultConfig()
 
 	// Load configuration
-	err := LoadConfig(*configURL)
+	var configToLoad string
+	if *configPath != "" {
+		configToLoad = *configPath
+	} else {
+		configToLoad = *configURL
+	}
+	err := LoadConfig(configToLoad)
 	if err != nil {
 		slog.Warn("Could not load config, creating new one", "error", err)
 
@@ -71,7 +82,7 @@ func main() {
 	}
 
 	// Initialize OpenGraph database
-	slog.Info("Initializing OpenGraph cache database")
+	slog.Debug("Initializing OpenGraph cache database")
 	db, err := InitOpenGraphDB()
 	if err != nil {
 		slog.Error("Failed to initialize OpenGraph database", "error", err)
@@ -92,17 +103,28 @@ func main() {
 	redditAPI := NewRedditAPI(client)
 
 	// Fetch Reddit homepage posts
-	slog.Info("Fetching Reddit homepage posts")
+	slog.Debug("Fetching Reddit homepage posts")
 	posts, err := redditAPI.FetchRedditHomepage()
 	if err != nil {
 		slog.Error("Failed to fetch Reddit homepage", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("Fetched Reddit posts", "count", len(posts))
+	slog.Debug("Fetched Reddit posts", "count", len(posts))
 
-	// Filter posts
-	filteredPosts := FilterPosts(posts, GlobalConfig.ScoreFilter, GlobalConfig.CommentFilter)
-	slog.Info("Filtered posts", "count", len(filteredPosts), "minScore", GlobalConfig.ScoreFilter, "minComments", GlobalConfig.CommentFilter)
+	// Filter posts using command-line flags if provided, otherwise use config
+	minScore := GlobalConfig.ScoreFilter
+	if *minPoints != 50 { // 50 is the default, so if it's different, use the flag
+		minScore = *minPoints
+	}
+
+	filteredPosts := FilterPosts(posts, minScore, GlobalConfig.CommentFilter)
+	slog.Debug("Filtered posts", "count", len(filteredPosts), "minScore", minScore, "minComments", GlobalConfig.CommentFilter)
+
+	// Apply limit if specified
+	if *limit > 0 && len(filteredPosts) > *limit {
+		filteredPosts = filteredPosts[:*limit]
+		slog.Debug("Limited posts", "count", len(filteredPosts), "limit", *limit)
+	}
 
 	// Create OpenGraph fetcher
 	ogFetcher := NewOpenGraphFetcher(db)
@@ -111,7 +133,7 @@ func main() {
 	feedGenerator := NewFeedGenerator(ogFetcher)
 
 	// Generate feed
-	slog.Info("Generating feed", "type", GlobalConfig.FeedType)
+	slog.Debug("Generating feed", "type", GlobalConfig.FeedType)
 	feed, err := feedGenerator.GenerateFeed(filteredPosts, GlobalConfig.FeedType)
 	if err != nil {
 		slog.Error("Failed to generate feed", "error", err)
@@ -124,25 +146,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Save feed to file
-	if err := feedGenerator.SaveFeedToFile(feed, GlobalConfig.FeedType, GlobalConfig.OutputPath); err != nil {
+	// Save feed to file using outDir flag
+	outputPath := GlobalConfig.OutputPath
+	if *outDir != "." {
+		// Extract filename from the configured output path and combine with outDir
+		filename := filepath.Base(outputPath)
+		outputPath = filepath.Join(*outDir, filename)
+	}
+
+	if err := feedGenerator.SaveFeedToFile(feed, GlobalConfig.FeedType, outputPath); err != nil {
 		slog.Error("Failed to save feed to file", "error", err)
 		os.Exit(1)
 	}
 
 	// Display success message
-	slog.Info("Feed generation completed successfully",
+	slog.Debug("Feed generation completed successfully",
 		"type", GlobalConfig.FeedType,
-		"path", GlobalConfig.OutputPath,
+		"path", outputPath,
 		"items", len(feed.Items))
 
-	fmt.Printf("🎉 Successfully generated %s feed and saved to %s\n", GlobalConfig.FeedType, GlobalConfig.OutputPath)
+	// Only show success message when debug mode is enabled
+	if *debug {
+		fmt.Printf("🎉 Successfully generated %s feed and saved to %s\n", GlobalConfig.FeedType, outputPath)
+	}
 }
 
 // setupLogging configures structured logging
 func setupLogging() {
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: slog.LevelError, // Silent by default, only show errors
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				return slog.Attr{Key: "time", Value: slog.StringValue(a.Value.Time().Format("15:04:05"))}
@@ -187,8 +219,8 @@ func setupInteractiveConfig() error {
 	}
 
 	GlobalConfig.RedirectURI = fmt.Sprintf("http://localhost:%s/callback", AuthPort)
-	GlobalConfig.FeedType = "rss"                        // Default feed type
-	GlobalConfig.OutputPath = "reddit_homepage_feed.xml" // Default output path
+	GlobalConfig.FeedType = "rss"          // Default feed type
+	GlobalConfig.OutputPath = "reddit.xml" // Default output path
 
 	return nil
 }
@@ -196,11 +228,11 @@ func setupInteractiveConfig() error {
 // handleAuthentication manages OAuth2 authentication flow
 func handleAuthentication() error {
 	if GlobalConfig.RefreshToken == "" {
-		slog.Info("No refresh token found, starting browser authentication")
+		slog.Debug("No refresh token found, starting browser authentication")
 		return AuthenticateUser()
 	}
 
-	slog.Info("Refresh token found, attempting to refresh access token")
+	slog.Debug("Refresh token found, attempting to refresh access token")
 	Token = &oauth2.Token{
 		RefreshToken: GlobalConfig.RefreshToken,
 		AccessToken:  GlobalConfig.AccessToken,
@@ -208,14 +240,14 @@ func handleAuthentication() error {
 	}
 
 	if !Token.Valid() {
-		slog.Info("Access token expired or invalid, refreshing")
+		slog.Debug("Access token expired or invalid, refreshing")
 		if err := RefreshAccessToken(); err != nil {
 			slog.Error("Failed to refresh access token", "error", err)
 			return err
 		}
-		slog.Info("Access token refreshed successfully")
+		slog.Debug("Access token refreshed successfully")
 	} else {
-		slog.Info("Access token is still valid")
+		slog.Debug("Access token is still valid")
 	}
 
 	return nil

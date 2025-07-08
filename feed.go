@@ -43,13 +43,21 @@ func (fg *FeedGenerator) GenerateFeed(posts []RedditPost, feedType string) (*fee
 	for _, post := range posts {
 		if post.Data.URL != "" {
 			urls = append(urls, post.Data.URL)
+			slog.Debug("Collected URL for OpenGraph", "url", post.Data.URL, "title", post.Data.Title)
 		}
 	}
 
 	// Fetch OpenGraph data concurrently
 	var ogData map[string]*OpenGraphData
 	if fg.ogFetcher != nil {
+		slog.Info("Fetching OpenGraph data", "url_count", len(urls))
 		ogData = fg.ogFetcher.FetchConcurrentOpenGraph(urls)
+		slog.Info("OpenGraph fetch completed", "results_count", len(ogData))
+		for url, og := range ogData {
+			if og != nil {
+				slog.Debug("OpenGraph data fetched", "url", url, "title", og.Title, "has_description", og.Description != "")
+			}
+		}
 	}
 
 	// Create feed items
@@ -71,8 +79,13 @@ func (fg *FeedGenerator) createFeedItem(post RedditPost, ogData map[string]*Open
 	// Add OpenGraph data if available
 	if ogData != nil {
 		if og, exists := ogData[post.Data.URL]; exists && og != nil {
+			slog.Debug("Adding OpenGraph preview", "url", post.Data.URL, "title", og.Title)
 			description += fg.formatOpenGraphPreview(og)
+		} else {
+			slog.Debug("No OpenGraph data found", "url", post.Data.URL, "exists", exists)
 		}
+	} else {
+		slog.Debug("No OpenGraph data map available", "url", post.Data.URL)
 	}
 
 	// Note: Categories would be added here if supported by gorilla/feeds
