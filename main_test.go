@@ -102,6 +102,33 @@ func TestParseOpenGraphTagsEmpty(t *testing.T) {
 		t.Fatalf("parseOpenGraphTags failed: %v", err)
 	}
 
+	// With enhanced fallback behavior, regular title should be extracted
+	if og.Title != "Regular Title" {
+		t.Errorf("Expected title 'Regular Title', got '%s'", og.Title)
+	}
+
+	if og.Description != "" {
+		t.Errorf("Expected empty description, got '%s'", og.Description)
+	}
+}
+
+func TestParseOpenGraphTagsNoTitle(t *testing.T) {
+	htmlContent := `
+	<html>
+	<head>
+	</head>
+	<body>
+		<h1>Test Page</h1>
+	</body>
+	</html>
+	`
+
+	og, err := parseOpenGraphTags(htmlContent)
+	if err != nil {
+		t.Fatalf("parseOpenGraphTags failed: %v", err)
+	}
+
+	// With no title tag, should be empty
 	if og.Title != "" {
 		t.Errorf("Expected empty title, got '%s'", og.Title)
 	}
