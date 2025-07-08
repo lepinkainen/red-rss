@@ -17,7 +17,8 @@ type Config struct {
 	ExpiresAt     time.Time `json:"expires_at"`
 	ScoreFilter   int       `json:"score_filter"`
 	CommentFilter int       `json:"comment_filter"`
-	FeedType      string    `json:"feed_type"` // "rss" or "atom"
+	FeedType      string    `json:"feed_type"`     // "rss" or "atom"
+	EnhancedAtom  bool      `json:"enhanced_atom"` // Use enhanced Atom features
 	OutputPath    string    `json:"output_path"`
 }
 

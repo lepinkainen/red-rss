@@ -127,6 +127,7 @@ func validateConfig(config *Config) error {
 func InitializeDefaultConfig() {
 	GlobalConfig.ScoreFilter = 0
 	GlobalConfig.CommentFilter = 0
-	GlobalConfig.FeedType = "rss"
+	GlobalConfig.FeedType = "atom"
+	GlobalConfig.EnhancedAtom = true
 	GlobalConfig.OutputPath = "reddit.xml"
 }

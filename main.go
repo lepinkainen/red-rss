@@ -133,20 +133,9 @@ func main() {
 	feedGenerator := NewFeedGenerator(ogFetcher)
 
 	// Generate feed
-	slog.Debug("Generating feed", "type", GlobalConfig.FeedType)
-	feed, err := feedGenerator.GenerateFeed(filteredPosts, GlobalConfig.FeedType)
-	if err != nil {
-		slog.Error("Failed to generate feed", "error", err)
-		os.Exit(1)
-	}
+	slog.Debug("Generating feed", "type", GlobalConfig.FeedType, "enhanced", GlobalConfig.EnhancedAtom)
 
-	// Validate feed
-	if err := feedGenerator.ValidateFeed(feed); err != nil {
-		slog.Error("Feed validation failed", "error", err)
-		os.Exit(1)
-	}
-
-	// Save feed to file using outDir flag
+	// Determine output path
 	outputPath := GlobalConfig.OutputPath
 	if *outDir != "." {
 		// Extract filename from the configured output path and combine with outDir
@@ -154,16 +143,43 @@ func main() {
 		outputPath = filepath.Join(*outDir, filename)
 	}
 
-	if err := feedGenerator.SaveFeedToFile(feed, GlobalConfig.FeedType, outputPath); err != nil {
-		slog.Error("Failed to save feed to file", "error", err)
-		os.Exit(1)
-	}
+	// Use enhanced Atom feed if enabled and feed type is atom
+	if GlobalConfig.FeedType == "atom" && GlobalConfig.EnhancedAtom {
+		slog.Debug("Using enhanced Atom feed generation")
+		if err := feedGenerator.SaveCustomAtomFeedToFile(filteredPosts, outputPath); err != nil {
+			slog.Error("Failed to save enhanced Atom feed to file", "error", err)
+			os.Exit(1)
+		}
 
-	// Display success message
-	slog.Debug("Feed generation completed successfully",
-		"type", GlobalConfig.FeedType,
-		"path", outputPath,
-		"items", len(feed.Items))
+		// Display success message
+		slog.Debug("Enhanced Atom feed generation completed successfully",
+			"path", outputPath,
+			"items", len(filteredPosts))
+	} else {
+		// Use standard feed generation
+		feed, err := feedGenerator.GenerateFeed(filteredPosts, GlobalConfig.FeedType)
+		if err != nil {
+			slog.Error("Failed to generate feed", "error", err)
+			os.Exit(1)
+		}
+
+		// Validate feed
+		if err := feedGenerator.ValidateFeed(feed); err != nil {
+			slog.Error("Feed validation failed", "error", err)
+			os.Exit(1)
+		}
+
+		if err := feedGenerator.SaveFeedToFile(feed, GlobalConfig.FeedType, outputPath); err != nil {
+			slog.Error("Failed to save feed to file", "error", err)
+			os.Exit(1)
+		}
+
+		// Display success message
+		slog.Debug("Feed generation completed successfully",
+			"type", GlobalConfig.FeedType,
+			"path", outputPath,
+			"items", len(feed.Items))
+	}
 
 	// Only show success message when debug mode is enabled
 	if *debug {
@@ -219,7 +235,8 @@ func setupInteractiveConfig() error {
 	}
 
 	GlobalConfig.RedirectURI = fmt.Sprintf("http://localhost:%s/callback", AuthPort)
-	GlobalConfig.FeedType = "rss"          // Default feed type
+	GlobalConfig.FeedType = "atom"         // Default feed type
+	GlobalConfig.EnhancedAtom = true       // Enable enhanced Atom features
 	GlobalConfig.OutputPath = "reddit.xml" // Default output path
 
 	return nil

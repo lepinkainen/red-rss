@@ -152,6 +152,28 @@ func (fg *FeedGenerator) SaveFeedToFile(feed *feeds.Feed, feedType, outputPath s
 	return nil
 }
 
+// SaveCustomAtomFeedToFile saves a custom enhanced Atom feed to a specified file
+func (fg *FeedGenerator) SaveCustomAtomFeedToFile(posts []RedditPost, outputPath string) error {
+	atomContent, err := fg.CreateCustomAtomFeed(posts)
+	if err != nil {
+		return fmt.Errorf("failed to create custom atom feed: %w", err)
+	}
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	_, err = file.WriteString(atomContent)
+	if err != nil {
+		return fmt.Errorf("failed to write custom atom feed: %w", err)
+	}
+
+	slog.Info("Enhanced Atom feed saved successfully", "path", outputPath)
+	return nil
+}
+
 // ValidateFeed validates the generated feed structure
 func (fg *FeedGenerator) ValidateFeed(feed *feeds.Feed) error {
 	if feed == nil {
@@ -247,40 +269,123 @@ type FeedMetadata struct {
 	NewestItem  time.Time
 }
 
-// CreateCustomAtomFeed creates a custom Atom feed structure (similar to HN tool)
+// CreateCustomAtomFeed creates a custom Atom feed structure with enhanced features
 func (fg *FeedGenerator) CreateCustomAtomFeed(posts []RedditPost) (string, error) {
 	now := time.Now()
 
+	// Collect URLs for concurrent OpenGraph fetching
+	urls := make([]string, 0, len(posts))
+	for _, post := range posts {
+		if post.Data.URL != "" {
+			urls = append(urls, post.Data.URL)
+		}
+	}
+
+	// Fetch OpenGraph data concurrently
+	var ogData map[string]*OpenGraphData
+	if fg.ogFetcher != nil {
+		slog.Info("Fetching OpenGraph data for custom Atom feed", "url_count", len(urls))
+		ogData = fg.ogFetcher.FetchConcurrentOpenGraph(urls)
+	}
+
 	var atom strings.Builder
 	atom.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
-	atom.WriteString(`<feed xmlns="http://www.w3.org/2005/Atom">`)
+	atom.WriteString(`<feed xmlns="http://www.w3.org/2005/Atom" xmlns:reddit="http://reddit.com/atom/ns">`)
 	atom.WriteString(`<title>My Reddit Homepage Feed</title>`)
 	atom.WriteString(`<link href="https://www.reddit.com/"/>`)
 	atom.WriteString(`<id>https://www.reddit.com/</id>`)
 	atom.WriteString(fmt.Sprintf(`<updated>%s</updated>`, now.Format(time.RFC3339)))
 	atom.WriteString(`<author><name>GoRedditFeedGenerator</name></author>`)
+	atom.WriteString(`<subtitle>Filtered Reddit homepage posts with enhanced metadata</subtitle>`)
+	atom.WriteString(`<generator uri="https://github.com/your-username/red-rss">Red RSS Generator</generator>`)
 
 	for _, post := range posts {
 		atom.WriteString(`<entry>`)
 		atom.WriteString(fmt.Sprintf(`<title>%s</title>`, escapeXML(post.Data.Title)))
-		atom.WriteString(fmt.Sprintf(`<link href="%s"/>`, escapeXML(post.Data.URL)))
+
+		// Multiple links: Reddit permalink and external URL
+		atom.WriteString(fmt.Sprintf(`<link rel="alternate" type="text/html" href="%s"/>`, escapeXML(post.Data.URL)))
+		atom.WriteString(fmt.Sprintf(`<link rel="replies" type="text/html" href="https://www.reddit.com%s" title="Reddit Discussion"/>`, escapeXML(post.Data.Permalink)))
+
 		atom.WriteString(fmt.Sprintf(`<id>https://www.reddit.com%s</id>`, escapeXML(post.Data.Permalink)))
 		atom.WriteString(fmt.Sprintf(`<updated>%s</updated>`, time.Unix(int64(post.Data.CreatedUTC), 0).Format(time.RFC3339)))
-		atom.WriteString(fmt.Sprintf(`<author><name>%s</name></author>`, escapeXML(post.Data.Author)))
+		atom.WriteString(fmt.Sprintf(`<published>%s</published>`, time.Unix(int64(post.Data.CreatedUTC), 0).Format(time.RFC3339)))
 
-		// Add categories
-		atom.WriteString(fmt.Sprintf(`<category term="r/%s"/>`, escapeXML(post.Data.Subreddit)))
+		// Enhanced author information
+		atom.WriteString(fmt.Sprintf(`<author><name>%s</name><uri>https://www.reddit.com/user/%s</uri></author>`, escapeXML(post.Data.Author), escapeXML(post.Data.Author)))
 
-		// Add summary
+		// Categories for subreddit
+		atom.WriteString(fmt.Sprintf(`<category term="r/%s" label="r/%s"/>`, escapeXML(post.Data.Subreddit), escapeXML(post.Data.Subreddit)))
+
+		// Reddit-specific metadata using custom namespace
+		atom.WriteString(fmt.Sprintf(`<reddit:score>%d</reddit:score>`, post.Data.Score))
+		atom.WriteString(fmt.Sprintf(`<reddit:comments>%d</reddit:comments>`, post.Data.NumComments))
+		atom.WriteString(fmt.Sprintf(`<reddit:subreddit>r/%s</reddit:subreddit>`, escapeXML(post.Data.Subreddit)))
+
+		// Enhanced content with OpenGraph data
+		content := fg.buildEnhancedContent(post, ogData)
+		atom.WriteString(fmt.Sprintf(`<content type="html">%s</content>`, escapeXML(content)))
+
+		// Summary
 		summary := fmt.Sprintf("Score: %d, Comments: %d, Subreddit: r/%s",
 			post.Data.Score, post.Data.NumComments, post.Data.Subreddit)
 		atom.WriteString(fmt.Sprintf(`<summary>%s</summary>`, escapeXML(summary)))
+
+		// Add thumbnail as enclosure if available from OpenGraph
+		if ogData != nil {
+			if og, exists := ogData[post.Data.URL]; exists && og != nil && og.Image != "" {
+				atom.WriteString(fmt.Sprintf(`<link rel="enclosure" type="image/jpeg" href="%s"/>`, escapeXML(og.Image)))
+			}
+		}
 
 		atom.WriteString(`</entry>`)
 	}
 
 	atom.WriteString(`</feed>`)
 	return atom.String(), nil
+}
+
+// buildEnhancedContent creates rich HTML content for Atom feeds
+func (fg *FeedGenerator) buildEnhancedContent(post RedditPost, ogData map[string]*OpenGraphData) string {
+	var content strings.Builder
+
+	// Add basic Reddit metadata
+	content.WriteString(fmt.Sprintf(`<div class="reddit-metadata">
+<p><strong>Score:</strong> %d | <strong>Comments:</strong> %d | <strong>Subreddit:</strong> <a href="https://www.reddit.com/r/%s">r/%s</a></p>
+</div>`, post.Data.Score, post.Data.NumComments, post.Data.Subreddit, post.Data.Subreddit))
+
+	// Add OpenGraph preview if available
+	if ogData != nil {
+		if og, exists := ogData[post.Data.URL]; exists && og != nil {
+			content.WriteString(`<div class="link-preview">`)
+			content.WriteString(`<h3>🔗 Link Preview</h3>`)
+
+			if og.Image != "" {
+				content.WriteString(fmt.Sprintf(`<img src="%s" alt="Preview image" style="max-width: 200px; height: auto;"/>`, og.Image))
+			}
+
+			if og.Title != "" {
+				content.WriteString(fmt.Sprintf(`<h4>%s</h4>`, og.Title))
+			}
+
+			if og.Description != "" {
+				content.WriteString(fmt.Sprintf(`<p>%s</p>`, og.Description))
+			}
+
+			if og.SiteName != "" {
+				content.WriteString(fmt.Sprintf(`<p><em>Source: %s</em></p>`, og.SiteName))
+			}
+
+			content.WriteString(`</div>`)
+		}
+	}
+
+	// Add links section
+	content.WriteString(`<div class="links">`)
+	content.WriteString(fmt.Sprintf(`<p><a href="%s">View External Link</a> | <a href="https://www.reddit.com%s">Reddit Discussion</a></p>`, post.Data.URL, post.Data.Permalink))
+	content.WriteString(`</div>`)
+
+	return content.String()
 }
 
 // escapeXML escapes XML special characters
