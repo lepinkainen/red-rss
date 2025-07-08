@@ -1,0 +1,51 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the reddit-feed-generator binary
+    deps: [test, lint]
+    cmds:
+      - mkdir -p build
+      - go build -o build/reddit-feed-generator
+
+  build-linux:
+    desc: Build for Linux
+    deps: [test, lint]
+    cmds:
+      - mkdir -p build
+      - GOOS=linux GOARCH=amd64 go build -o build/reddit-feed-generator-linux
+
+  build-ci:
+    desc: Build for CI environment
+    deps: [test-ci, lint]
+    cmds:
+      - mkdir -p build
+      - go build -o build/reddit-feed-generator
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test -v ./...
+
+  test-ci:
+    desc: Run tests with CI tags and coverage
+    cmds:
+      - go test -tags=ci -cover -v ./...
+
+  lint:
+    desc: Run linter and formatter
+    cmds:
+      - gofmt -w .
+      - go vet ./...
+      - go mod tidy
+
+  run:
+    desc: Run the application
+    deps: [build]
+    cmds:
+      - ./build/reddit-feed-generator
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf build/
