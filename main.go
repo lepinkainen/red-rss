@@ -2,19 +2,24 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv" // Import strconv for string to int conversion
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/feeds" // For RSS/Atom feed generation
+	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
+	_ "modernc.org/sqlite" // SQLite driver
 )
 
 // Config struct to hold application settings and tokens
@@ -53,9 +58,22 @@ type RedditListing struct {
 	} `json:"data"`
 }
 
+// OpenGraphData represents OpenGraph metadata for external links
+type OpenGraphData struct {
+	URL         string    `json:"url"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Image       string    `json:"image"`
+	SiteName    string    `json:"site_name"`
+	FetchedAt   time.Time `json:"fetched_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
 const (
-	configFileName = "reddit_feed_config.json"
-	authPort       = "8080" // Port for the local authentication server
+	configFileName      = "reddit_feed_config.json"
+	authPort            = "8080"               // Port for the local authentication server
+	openGraphDBFile     = "opengraph_cache.db" // SQLite database file for OpenGraph cache
+	openGraphCacheHours = 24                   // Cache expiry in hours
 )
 
 var (
@@ -72,7 +90,7 @@ func main() {
 	// Load configuration
 	err := loadConfig()
 	if err != nil {
-		log.Printf("Could not load config, creating new one: %v", err)
+		fmt.Printf("⚙️  Could not load config, creating new one: %v\n", err)
 		// Prompt user for client ID
 		if config.ClientID == "" {
 			fmt.Print("Enter Reddit Client ID (from your Reddit app settings): ")
@@ -86,7 +104,7 @@ func main() {
 		fmt.Scanln(&scoreInput)
 		config.ScoreFilter, err = strconv.Atoi(scoreInput)
 		if err != nil {
-			log.Printf("Invalid score filter input, defaulting to 0: %v", err)
+			fmt.Printf("⚠️  Invalid score filter input, defaulting to 0: %v\n", err)
 			config.ScoreFilter = 0
 		}
 
@@ -96,7 +114,7 @@ func main() {
 		fmt.Scanln(&commentInput)
 		config.CommentFilter, err = strconv.Atoi(commentInput)
 		if err != nil {
-			log.Printf("Invalid comment filter input, defaulting to 0: %v", err)
+			fmt.Printf("⚠️  Invalid comment filter input, defaulting to 0: %v\n", err)
 			config.CommentFilter = 0
 		}
 
@@ -123,45 +141,53 @@ func main() {
 
 	// Authenticate or refresh token
 	if config.RefreshToken == "" {
-		log.Println("No refresh token found. Starting browser authentication...")
+		fmt.Println("🔐 No refresh token found. Starting browser authentication...")
 		authenticateUser()
 	} else {
-		log.Println("Refresh token found. Attempting to refresh access token...")
+		fmt.Println("🔄 Refresh token found. Attempting to refresh access token...")
 		token = &oauth2.Token{
 			RefreshToken: config.RefreshToken,
 			AccessToken:  config.AccessToken, // Use existing access token if still valid
 			Expiry:       config.ExpiresAt,
 		}
 		if !token.Valid() {
-			log.Println("Access token expired or invalid. Refreshing...")
+			fmt.Println("🔄 Access token expired or invalid. Refreshing...")
 			err = refreshAccessToken()
 			if err != nil {
 				log.Fatalf("Failed to refresh access token: %v", err)
 			}
-			log.Println("Access token refreshed successfully.")
+			fmt.Println("✅ Access token refreshed successfully.")
 		} else {
-			log.Println("Access token is still valid.")
+			fmt.Println("✅ Access token is still valid.")
 		}
 	}
+
+	// Initialize OpenGraph database
+	fmt.Println("📊 Initializing OpenGraph cache database...")
+	db, err := initOpenGraphDB()
+	if err != nil {
+		log.Fatalf("Failed to initialize OpenGraph database: %v", err)
+	}
+	defer db.Close()
 
 	// Create an authenticated HTTP client
 	client := oauth2Config.Client(context.Background(), token)
 
 	// Fetch Reddit homepage posts
-	log.Println("Fetching Reddit homepage posts...")
+	fmt.Println("📱 Fetching Reddit homepage posts...")
 	posts, err := fetchRedditHomepage(client)
 	if err != nil {
 		log.Fatalf("Failed to fetch Reddit homepage: %v", err)
 	}
-	log.Printf("Fetched %d posts.", len(posts))
+	fmt.Printf("📋 Fetched %d posts.\n", len(posts))
 
 	// Filter posts
 	filteredPosts := filterPosts(posts, config.ScoreFilter, config.CommentFilter)
-	log.Printf("Filtered down to %d posts (score >= %d, comments >= %d).", len(filteredPosts), config.ScoreFilter, config.CommentFilter)
+	fmt.Printf("🎯 Filtered down to %d posts (score >= %d, comments >= %d).\n", len(filteredPosts), config.ScoreFilter, config.CommentFilter)
 
-	// Generate feed
-	log.Printf("Generating %s feed...", config.FeedType)
-	feed, err := generateFeed(filteredPosts, config.FeedType)
+	// Generate feed with OpenGraph data
+	fmt.Printf("📰 Generating %s feed...\n", config.FeedType)
+	feed, err := generateFeed(filteredPosts, config.FeedType, db)
 	if err != nil {
 		log.Fatalf("Failed to generate feed: %v", err)
 	}
@@ -172,7 +198,7 @@ func main() {
 		log.Fatalf("Failed to save feed to file: %v", err)
 	}
 
-	log.Printf("Successfully generated %s feed and saved to %s", config.FeedType, config.OutputPath)
+	fmt.Printf("🎉 Successfully generated %s feed and saved to %s\n", config.FeedType, config.OutputPath)
 }
 
 // loadConfig loads the configuration from a JSON file
@@ -212,17 +238,17 @@ func authenticateUser() {
 	go func() {
 		defer serverWg.Done()
 		http.HandleFunc("/callback", oauth2CallbackHandler)
-		log.Printf("Starting local HTTP server on :%s for OAuth2 callback...", authPort)
+		fmt.Printf("🌐 Starting local HTTP server on :%s for OAuth2 callback...\n", authPort)
 		server := &http.Server{Addr: ":" + authPort}
 
 		// Goroutine to listen for server shutdown signal
 		go func() {
 			<-serverCtx.Done() // Wait for the main goroutine to cancel the context
-			log.Println("Received shutdown signal for local HTTP server.")
+			fmt.Println("🛑 Received shutdown signal for local HTTP server.")
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := server.Shutdown(ctx); err != nil {
-				log.Printf("Error shutting down HTTP server: %v", err)
+				fmt.Printf("❌ Error shutting down HTTP server: %v\n", err)
 			}
 		}()
 
@@ -235,7 +261,7 @@ func authenticateUser() {
 	authURL := oauth2Config.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("duration", "permanent"))
 
 	// Open the URL in the user's default browser
-	log.Printf("Opening browser for Reddit authentication at: %s", authURL)
+	fmt.Printf("🌐 Opening browser for Reddit authentication at: %s\n", authURL)
 	err := openBrowser(authURL)
 	if err != nil {
 		log.Fatalf("Failed to open browser: %v. Please open the URL manually.", err)
@@ -264,7 +290,7 @@ func authenticateUser() {
 
 		// Check if it's a rate limit error (429 Too Many Requests)
 		if oe, ok := err.(*oauth2.RetrieveError); ok && oe.Response.StatusCode == http.StatusTooManyRequests {
-			log.Printf("Received 429 Too Many Requests. Retrying in %v...", initialBackoff)
+			fmt.Printf("⏳ Received 429 Too Many Requests. Retrying in %v...\n", initialBackoff)
 			time.Sleep(initialBackoff)
 			initialBackoff *= 2 // Exponential backoff
 			continue
@@ -282,7 +308,7 @@ func authenticateUser() {
 	config.RefreshToken = token.RefreshToken
 	config.ExpiresAt = token.Expiry
 	saveConfig()
-	log.Println("Authentication successful. Tokens saved.")
+	fmt.Println("✅ Authentication successful. Tokens saved.")
 
 	// Ensure the server goroutine has finished before proceeding
 	serverWg.Wait()
@@ -296,27 +322,27 @@ func oauth2CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	errorParam := query.Get("error")
 
 	if errorParam != "" {
-		log.Printf("OAuth2 callback error: %s", errorParam)
+		fmt.Printf("❌ OAuth2 callback error: %s\n", errorParam)
 		fmt.Fprintf(w, "Authentication failed: %s. Please check the console for details.", errorParam)
 		authCodeChan <- "" // Send empty string to unblock main goroutine
 		return
 	}
 
 	if state != "state" { // Simple state check, you might want a more robust one
-		log.Printf("State mismatch: expected 'state', got '%s'", state)
+		fmt.Printf("❌ State mismatch: expected 'state', got '%s'\n", state)
 		fmt.Fprint(w, "Authentication failed: State mismatch.")
 		authCodeChan <- ""
 		return
 	}
 
 	if code == "" {
-		log.Println("No authorization code received in callback.")
+		fmt.Println("❌ No authorization code received in callback.")
 		fmt.Fprint(w, "Authentication failed: No code received.")
 		authCodeChan <- ""
 		return
 	}
 
-	log.Println("Authorization code received successfully.")
+	fmt.Println("✅ Authorization code received successfully.")
 	fmt.Fprint(w, "Authentication successful! You can close this browser tab.")
 	authCodeChan <- code // Send the code to the main goroutine
 }
@@ -404,7 +430,7 @@ func filterPosts(posts []RedditPost, minScore, minComments int) []RedditPost {
 }
 
 // generateFeed creates an RSS or Atom feed from the filtered Reddit posts.
-func generateFeed(posts []RedditPost, feedType string) (*feeds.Feed, error) {
+func generateFeed(posts []RedditPost, feedType string, db *sql.DB) (*feeds.Feed, error) {
 	now := time.Now()
 	feed := &feeds.Feed{
 		Title:       "My Reddit Homepage Feed",
@@ -416,10 +442,28 @@ func generateFeed(posts []RedditPost, feedType string) (*feeds.Feed, error) {
 	}
 
 	for _, post := range posts {
+		// Build base description with Reddit metadata
+		description := fmt.Sprintf("Score: %d, Comments: %d, Subreddit: r/%s", post.Data.Score, post.Data.NumComments, post.Data.Subreddit)
+
+		// Try to get OpenGraph data for external links
+		og := getOpenGraphPreview(db, post.Data.URL)
+		if og != nil && (og.Title != "" || og.Description != "") {
+			description += "\n\n🔗 Link Preview:"
+			if og.Title != "" {
+				description += fmt.Sprintf("\nTitle: %s", og.Title)
+			}
+			if og.Description != "" {
+				description += fmt.Sprintf("\nDescription: %s", og.Description)
+			}
+			if og.SiteName != "" {
+				description += fmt.Sprintf("\nSite: %s", og.SiteName)
+			}
+		}
+
 		item := &feeds.Item{
 			Title:       post.Data.Title,
 			Link:        &feeds.Link{Href: post.Data.URL},
-			Description: fmt.Sprintf("Score: %d, Comments: %d, Subreddit: r/%s", post.Data.Score, post.Data.NumComments, post.Data.Subreddit),
+			Description: description,
 			Author:      &feeds.Author{Name: post.Data.Author},
 			Created:     time.Unix(int64(post.Data.CreatedUTC), 0),
 			Id:          fmt.Sprintf("https://www.reddit.com%s", post.Data.Permalink), // Unique ID for the item
@@ -443,6 +487,206 @@ func saveFeedToFile(feed *feeds.Feed, feedType, outputPath string) error {
 		return feed.WriteAtom(file)
 	}
 	return fmt.Errorf("unsupported feed type: %s", feedType)
+}
+
+// initOpenGraphDB initializes the SQLite database for OpenGraph caching
+func initOpenGraphDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite", openGraphDBFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Create table if it doesn't exist
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS opengraph_cache (
+		url TEXT PRIMARY KEY,
+		title TEXT,
+		description TEXT,
+		image TEXT,
+		site_name TEXT,
+		fetched_at DATETIME,
+		expires_at DATETIME
+	);`
+
+	_, err = db.Exec(createTableSQL)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create table: %w", err)
+	}
+
+	return db, nil
+}
+
+// getCachedOpenGraph retrieves cached OpenGraph data from the database
+func getCachedOpenGraph(db *sql.DB, url string) (*OpenGraphData, error) {
+	query := `SELECT url, title, description, image, site_name, fetched_at, expires_at 
+			  FROM opengraph_cache WHERE url = ? AND expires_at > datetime('now')`
+
+	row := db.QueryRow(query, url)
+
+	var og OpenGraphData
+	err := row.Scan(&og.URL, &og.Title, &og.Description, &og.Image, &og.SiteName, &og.FetchedAt, &og.ExpiresAt)
+	if err == sql.ErrNoRows {
+		return nil, nil // No cached data found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan cached data: %w", err)
+	}
+
+	return &og, nil
+}
+
+// saveCachedOpenGraph saves OpenGraph data to the database cache
+func saveCachedOpenGraph(db *sql.DB, og *OpenGraphData) error {
+	query := `INSERT OR REPLACE INTO opengraph_cache 
+			  (url, title, description, image, site_name, fetched_at, expires_at)
+			  VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+	_, err := db.Exec(query, og.URL, og.Title, og.Description, og.Image, og.SiteName, og.FetchedAt, og.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("failed to save cached data: %w", err)
+	}
+
+	return nil
+}
+
+// isRedditURL checks if a URL is a Reddit URL
+func isRedditURL(url string) bool {
+	return strings.Contains(url, "reddit.com") || strings.Contains(url, "redd.it")
+}
+
+// isBlockedURL checks if a URL is from a domain that blocks external access
+func isBlockedURL(url string) bool {
+	return strings.Contains(url, "x.com") || strings.Contains(url, "twitter.com")
+}
+
+// fetchOpenGraphData fetches OpenGraph metadata from a URL
+func fetchOpenGraphData(url string) (*OpenGraphData, error) {
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 8 * time.Second, // 8 second timeout as requested (5-10 seconds)
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set a reasonable User-Agent
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GoRedditFeedGenerator/1.0)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP error: %s", resp.Status)
+	}
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Parse OpenGraph tags
+	og, err := parseOpenGraphTags(string(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OpenGraph tags: %w", err)
+	}
+
+	// Set metadata
+	now := time.Now()
+	og.URL = url
+	og.FetchedAt = now
+	og.ExpiresAt = now.Add(time.Duration(openGraphCacheHours) * time.Hour)
+
+	return og, nil
+}
+
+// parseOpenGraphTags extracts OpenGraph meta tags from HTML
+func parseOpenGraphTags(htmlContent string) (*OpenGraphData, error) {
+	og := &OpenGraphData{}
+
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+
+	var extractMeta func(*html.Node)
+	extractMeta = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "meta" {
+			var property, content string
+			for _, attr := range n.Attr {
+				switch attr.Key {
+				case "property":
+					property = attr.Val
+				case "content":
+					content = attr.Val
+				}
+			}
+
+			// Extract OpenGraph properties
+			switch property {
+			case "og:title":
+				og.Title = content
+			case "og:description":
+				og.Description = content
+			case "og:image":
+				og.Image = content
+			case "og:site_name":
+				og.SiteName = content
+			}
+		}
+
+		// Recursively process child nodes
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			extractMeta(c)
+		}
+	}
+
+	extractMeta(doc)
+	return og, nil
+}
+
+// getOpenGraphPreview gets OpenGraph data for a URL, using cache when possible
+func getOpenGraphPreview(db *sql.DB, url string) *OpenGraphData {
+	// Check if it's a Reddit URL - skip OpenGraph for Reddit links
+	if isRedditURL(url) {
+		return nil
+	}
+
+	// Check if it's a blocked URL (x.com, twitter.com) - skip OpenGraph for blocked domains
+	if isBlockedURL(url) {
+		return nil
+	}
+
+	// Try to get from cache first
+	cached, err := getCachedOpenGraph(db, url)
+	if err != nil {
+		fmt.Printf("⚠️  Error reading OpenGraph cache for %s: %v\n", url, err)
+	}
+	if cached != nil {
+		return cached
+	}
+
+	// Fetch new OpenGraph data
+	fmt.Printf("🔍 Fetching OpenGraph data for: %s\n", url)
+	og, err := fetchOpenGraphData(url)
+	if err != nil {
+		fmt.Printf("⚠️  Failed to fetch OpenGraph data for %s: %v\n", url, err)
+		return nil
+	}
+
+	// Save to cache
+	err = saveCachedOpenGraph(db, og)
+	if err != nil {
+		fmt.Printf("⚠️  Failed to cache OpenGraph data for %s: %v\n", url, err)
+	}
+
+	return og
 }
 
 // init function to set up default configuration values if not specified
